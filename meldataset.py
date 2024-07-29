@@ -251,7 +251,10 @@ class MelDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
 
-        filename = self.audio_files[index]
+        line = self.audio_files[index]
+        strs = line.strip.split("|")
+        key = strs[0]
+        filename = str[1]
         if self._cache_ref_count == 0:
             audio, sampling_rate = load_wav(filename, self.sampling_rate)
             audio = audio / MAX_WAV_VALUE
@@ -269,7 +272,13 @@ class MelDataset(torch.utils.data.Dataset):
         audio = torch.FloatTensor(audio)
         audio = audio.unsqueeze(0)
 
-        if not self.fine_tuning:
+        try:
+            mel = np.load(os.path.join(self.base_mels_path, key + '.npy'))
+            print(f"Warning using local mel {key}.npy.")
+        except:
+            mel = None
+
+        if mel is None:
             if self.split:
                 if audio.size(1) >= self.segment_size:
                     max_audio_start = audio.size(1) - self.segment_size
@@ -297,8 +306,6 @@ class MelDataset(torch.utils.data.Dataset):
                 assert audio.shape[1] == mel.shape[2] * self.hop_size, "audio shape {} mel shape {}".format(audio.shape, mel.shape)
 
         else:
-            mel = np.load(
-                os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
             mel = torch.from_numpy(mel)
 
             if len(mel.shape) < 3:

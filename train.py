@@ -26,7 +26,7 @@ from bigvgan import BigVGAN
 from discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator, MultiBandDiscriminator, MultiScaleSubbandCQTDiscriminator
 from loss import feature_loss, generator_loss, discriminator_loss, MultiScaleMelSpectrogramLoss
 
-from utils import plot_spectrogram, plot_spectrogram_clipped, scan_checkpoint, load_checkpoint, save_checkpoint, save_audio
+from utils import plot_spectrogram, plot_spectrogram_clipped, scan_checkpoint, load_checkpoint, save_checkpoint, save_audio, get_logger
 import torchaudio as ta
 from pesq import pesq
 from tqdm import tqdm
@@ -95,6 +95,8 @@ def train(rank, a, h):
         print("Discriminator mrd params: {}".format(sum(p.numel() for p in mrd.parameters())))
         os.makedirs(a.checkpoint_path, exist_ok=True)
         print("checkpoints directory : ", a.checkpoint_path)
+        logger = get_logger(a.checkpoint_path)
+        logger.info(h)
 
     if os.path.isdir(a.checkpoint_path):
         # New in v2.1: if the step prefix pattern-based checkpoints are not found, also check for renamed files in Hugging Face Hub to resume training
