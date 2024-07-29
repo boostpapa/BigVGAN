@@ -20,7 +20,7 @@ import torch.multiprocessing as mp
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
 from env import AttrDict, build_env
-from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist, MAX_WAV_VALUE
+from meldataset import MelDataset, mel_spectrogram, MelSpectrogramFeatures, get_dataset_filelist1, MAX_WAV_VALUE
 
 from bigvgan import BigVGAN
 from discriminators import MultiPeriodDiscriminator, MultiResolutionDiscriminator, MultiBandDiscriminator, MultiScaleSubbandCQTDiscriminator
@@ -31,6 +31,9 @@ import torchaudio as ta
 from pesq import pesq
 from tqdm import tqdm
 import auraloss
+import logging
+
+logging.getLogger("numba").setLevel(logging.WARNING)
 
 torch.backends.cudnn.benchmark = False
 
@@ -72,6 +75,15 @@ def train(rank, a, h):
         fn_mel_loss_multiscale = MultiScaleMelSpectrogramLoss(sampling_rate=h.sampling_rate) # NOTE: accepts waveform as input
     else:
         fn_mel_loss_singlescale = F.l1_loss
+
+    if h.mel_type == "pytorch":
+        mel_pytorch = MelSpectrogramFeatures(sample_rate=h.sampling_rate,
+                                             n_fft=h.n_fft,
+                                             hop_length=h.hop_size,
+                                             win_length=h.win_size,
+                                             n_mels=h.num_mels,
+                                             mel_fmin=h.fmin,).to(device)
+        print(f"Warning use torchaudio.transforms.MelSpectrogram extract mel.")
 
     # print the model & number of parameters, and create or scan the latest checkpoint from checkpoints directory
     if rank == 0:
@@ -122,12 +134,12 @@ def train(rank, a, h):
     # define training and validation datasets
     # unseen_validation_filelist will contain sample filepaths outside the seen training & validation dataset
     # example: trained on LibriTTS, validate on VCTK
-    training_filelist, validation_filelist, list_unseen_validation_filelist = get_dataset_filelist(a)
+    training_filelist, validation_filelist, list_unseen_validation_filelist = get_dataset_filelist1(a)
 
     trainset = MelDataset(training_filelist, h, h.segment_size, h.n_fft, h.num_mels,
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
-                          fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir, is_seen=True)
+                          fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir, is_seen=True, mel_type=h.mel_type)
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
 
@@ -141,7 +153,7 @@ def train(rank, a, h):
         validset = MelDataset(validation_filelist, h, h.segment_size, h.n_fft, h.num_mels,
                               h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
                               fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
-                              base_mels_path=a.input_mels_dir, is_seen=True)
+                              base_mels_path=a.input_mels_dir, is_seen=True, mel_type=h.mel_type)
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
                                        sampler=None,
                                        batch_size=1,
@@ -154,7 +166,7 @@ def train(rank, a, h):
             unseen_validset = MelDataset(list_unseen_validation_filelist[i], h, h.segment_size, h.n_fft, h.num_mels,
                                          h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
                                          fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
-                                         base_mels_path=a.input_mels_dir, is_seen=False)
+                                         base_mels_path=a.input_mels_dir, is_seen=False, mel_type=h.mel_type)
             unseen_validation_loader = DataLoader(unseen_validset, num_workers=1, shuffle=False,
                                                   sampler=None,
                                                   batch_size=1,
@@ -192,7 +204,7 @@ def train(rank, a, h):
             print("step {} {} speaker validation...".format(steps, mode))
 
             # loop over validation set and compute metrics
-            for j, batch in tqdm(enumerate(loader)):
+            for j, batch in enumerate(loader):
                 x, y, _, y_mel = batch
                 y = y.to(device)
                 if hasattr(generator, 'module'):
@@ -200,9 +212,13 @@ def train(rank, a, h):
                 else:
                     y_g_hat = generator(x.to(device))
                 y_mel = y_mel.to(device, non_blocking=True)
-                y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
-                                              h.hop_size, h.win_size,
-                                              h.fmin, h.fmax_for_loss)
+                if h.mel_type == "pytorch":
+                    nframe = int(y_g_hat.shape[-1]/h.hop_size)
+                    y_g_hat_mel = mel_pytorch(y_g_hat.squeeze(1))[..., 0:nframe]
+                else:
+                    y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
+                                                  h.hop_size, h.win_size,
+                                                  h.fmin, h.fmax_for_loss)
                 val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                 # PESQ calculation. only evaluate PESQ if it's speech signal (nonspeech PESQ will error out)
@@ -223,11 +239,12 @@ def train(rank, a, h):
                         sw.add_audio('gt_{}/y_{}'.format(mode, j), y[0], steps, h.sampling_rate)
                         if a.save_audio: # also save audio to disk if --save_audio is set to True
                             save_audio(y[0], os.path.join(a.checkpoint_path, 'samples', 'gt_{}'.format(mode), '{:04d}.wav'.format(j)), h.sampling_rate)
-                        sw.add_figure('gt_{}/y_spec_{}'.format(mode, j), plot_spectrogram(x[0]), steps)
+                        #sw.add_figure('gt_{}/y_spec_{}'.format(mode, j), plot_spectrogram(x[0]), steps)
 
                     sw.add_audio('generated_{}/y_hat_{}'.format(mode, j), y_g_hat[0], steps, h.sampling_rate)
                     if a.save_audio: # also save audio to disk if --save_audio is set to True
                         save_audio(y_g_hat[0, 0], os.path.join(a.checkpoint_path, 'samples', '{}_{:08d}'.format(mode, steps), '{:04d}.wav'.format(j)), h.sampling_rate)
+                    '''
                     # spectrogram of synthesized audio
                     y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
                                                  h.sampling_rate, h.hop_size, h.win_size,
@@ -239,6 +256,7 @@ def train(rank, a, h):
                     spec_delta = torch.clamp(torch.abs(x[0] - y_hat_spec.squeeze(0).cpu()), min=1e-6, max=1.)
                     sw.add_figure('delta_dclip1_{}/spec_{}'.format(mode, j),
                                   plot_spectrogram_clipped(spec_delta.numpy(), clip_max=1.), steps)
+                    '''
 
             val_err = val_err_tot / (j + 1)
             val_pesq = val_pesq_tot / (j + 1)
@@ -247,6 +265,8 @@ def train(rank, a, h):
             sw.add_scalar("validation_{}/mel_spec_error".format(mode), val_err, steps)
             sw.add_scalar("validation_{}/pesq".format(mode), val_pesq, steps)
             sw.add_scalar("validation_{}/mrstft".format(mode), val_mrstft, steps)
+            logger.info('Steps : {:d}, mel_spec_error : {:4.3f}, pesq : {:4.3f}, mrstft : {:4.3f}'.
+                                format(steps, val_err, val_pesq, val_mrstft))
 
         generator.train()
 
@@ -255,9 +275,11 @@ def train(rank, a, h):
         if not a.skip_seen:
             validate(rank, a, h, validation_loader,
                      mode="seen_{}".format(train_loader.dataset.name))
+        '''
         for i in range(len(list_unseen_validation_loader)):
             validate(rank, a, h, list_unseen_validation_loader[i],
                      mode="unseen_{}".format(list_unseen_validation_loader[i].dataset.name))
+        '''
     # exit the script if --evaluate is set to True
     if a.evaluate:
         exit()
@@ -285,7 +307,11 @@ def train(rank, a, h):
             y = y.unsqueeze(1)
 
             y_g_hat = generator(x)
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
+            if h.mel_type == "pytorch":
+                nframe = int(y_g_hat.shape[-1] / h.hop_size)
+                y_g_hat_mel = mel_pytorch(y_g_hat.squeeze(1))[..., 0:nframe]
+            else:
+                y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
 
             optim_d.zero_grad()
 
@@ -347,7 +373,8 @@ def train(rank, a, h):
                 # STDOUT logging
                 if steps % a.stdout_interval == 0:
                     mel_error = loss_mel.item() / lambda_melloss # log training mel regression loss to stdout
-                    print(
+                    #print(
+                    logger.info(
                             f"Steps: {steps:d}, "
                             f"Gen Loss Total: {loss_gen_all:4.3f}, "
                             f"Mel Error: {mel_error:4.3f}, "
@@ -390,18 +417,22 @@ def train(rank, a, h):
 
                 # validation
                 if steps % a.validation_interval == 0:
+                    '''
                     # plot training input x so far used
                     for i_x in range(x.shape[0]):
                         sw.add_figure('training_input/x_{}'.format(i_x), plot_spectrogram(x[i_x].cpu()), steps)
                         sw.add_audio('training_input/y_{}'.format(i_x), y[i_x][0], steps, h.sampling_rate)
+                    '''
 
                     # seen and unseen speakers validation loops
                     if not a.debug and steps != 0:
                         validate(rank, a, h, validation_loader,
                                  mode="seen_{}".format(train_loader.dataset.name))
+                        '''
                         for i in range(len(list_unseen_validation_loader)):
                             validate(rank, a, h, list_unseen_validation_loader[i],
                                      mode="unseen_{}".format(list_unseen_validation_loader[i].dataset.name))
+                        '''
             steps += 1
             
             # BigVGAN-v2 learning rate scheduler is changed from epoch-level to step-level
