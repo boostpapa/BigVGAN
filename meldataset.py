@@ -18,6 +18,7 @@ import librosa
 import soundfile as sf
 import pathlib
 from tqdm import tqdm
+from torch import nn
 
 MAX_WAV_VALUE = 32767.0 # NOTE: 32768.0 -1 to prevent int16 overflow (results in popping sound in corner cases)
 
@@ -28,7 +29,7 @@ def load_wav(full_path, sr_target):
         #raise RuntimeError("Sampling rate of the file {} is {} Hz, but the model requires {} Hz".
         #      format(full_path, sampling_rate, sr_target))
         try:
-            data = librosa.resample(data, sampling_rate, sr_target)
+            data = librosa.resample(data, orig_sr=sampling_rate, target_sr=sr_target)
             #print(f"Warning: {full_path}, wave shape: {data.shape}, sample_rate: {sampling_rate}")
         except Exception as e:
             print(f"Error: {full_path} resample")
@@ -240,7 +241,7 @@ class MelDataset(torch.utils.data.Dataset):
                                                       win_length=win_size,
                                                       n_mels=num_mels,
                                                       mel_fmin=fmin,)
-            print(f"Warning use torchaudio.transforms.MelSpectrogram extract mel.")
+            #print(f"Warning use torchaudio.transforms.MelSpectrogram extract mel.")
 
 
         '''
@@ -252,9 +253,9 @@ class MelDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
 
         line = self.audio_files[index]
-        strs = line.strip.split("|")
+        strs = line.strip().split("|")
         key = strs[0]
-        filename = str[1]
+        filename = strs[1]
         if self._cache_ref_count == 0:
             audio, sampling_rate = load_wav(filename, self.sampling_rate)
             audio = audio / MAX_WAV_VALUE
@@ -274,13 +275,13 @@ class MelDataset(torch.utils.data.Dataset):
 
         try:
             mel = np.load(os.path.join(self.base_mels_path, key + '.npy'))
-            print(f"Warning using local mel {key}.npy.")
+            #print(f"Warning using local mel {key}.npy, shape {mel.shape}.")
         except:
             mel = None
 
         if mel is None:
             if self.split:
-                if audio.size(1) >= self.segment_size:
+                if audio.size(1) > self.segment_size:
                     max_audio_start = audio.size(1) - self.segment_size
                     audio_start = random.randint(0, max_audio_start)
                     audio = audio[:, audio_start:audio_start+self.segment_size]
@@ -311,10 +312,15 @@ class MelDataset(torch.utils.data.Dataset):
             if len(mel.shape) < 3:
                 mel = mel.unsqueeze(0)
 
+            fr_audio = math.floor(audio.size(1) / self.hop_size)
+            nframe = min(fr_audio, mel.size(-1))
+            mel = mel[..., 0:nframe]
+            audio = audio[:, 0:nframe*self.hop_size]
+
             if self.split:
                 frames_per_seg = math.ceil(self.segment_size / self.hop_size)
 
-                if audio.size(1) >= self.segment_size:
+                if audio.size(1) > self.segment_size:
                     mel_start = random.randint(0, mel.size(2) - frames_per_seg - 1)
                     mel = mel[:, :, mel_start:mel_start + frames_per_seg]
                     audio = audio[:, mel_start * self.hop_size:(mel_start + frames_per_seg) * self.hop_size]
